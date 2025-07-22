@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Este modelo cria a infraestrutura para uma API FastAPI no ECS (Fargate)
+  e um pipeline CI/CD dedicado para o backend, usando GitHub e CodeBuild.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Nome do projeto (usado para nomear recursos).
+    Default: MyFastAPIBackend
+
+  GitHubRepoName:
+    Type: String
+    Description: Nome do repositório GitHub do backend (ex: my-fastapi-backend-app).
+
+  GitHubOwner:
+    Type: String
+    Description: Nome do proprietário/organização do repositório GitHub do backend.
+
+  GitHubBranch:
+    Type: String
+    Description: Nome do branch para monitorar (ex: main, master).
+    Default: main
+
+  GitHubConnectionArn:
+    Type: String
+    Description: |
+      O ARN da conexão AWS CodeStar Connections para o GitHub.
+      Crie uma em AWS CodePipeline -> Settings -> Connections.
+    AllowedPattern: arn:aws:codestar-connections:[a-z0-9-]+:[0-9]{12}:connection/.*
+
+  S3ArtifactBucketName:
+    Type: String
+    Description: Nome do bucket S3 para armazenar artefatos do CodePipeline do backend.
+    Default: my-backend-artifacts-unique-12345 # Altere para um nome de bucket único
+
+  VpcId:
+    Type: String
+    Description: O ID da VPC onde os recursos serão implantados.
+
+  PublicSubnetId1:
+    Type: String
+    Description: O ID da primeira subnet pública para o ALB.
+
+  PublicSubnetId2:
+    Type: String
+    Description: O ID da segunda subnet pública para o ALB.
+
+  PrivateSubnetId1:
+    Type: String
+    Description: O ID da primeira subnet privada para as tarefas ECS (ou pública, se preferir).
+
+  PrivateSubnetId2:
+    Type: String
+    Description: O ID da segunda subnet privada para as tarefas ECS (ou pública, se preferir).
+
+Resources:
+  # --- ECR Repository para a imagem Docker do Backend ---
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-repo
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- ECS Cluster ---
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- IAM Roles para ECS Task e Execution ---
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+          Path: /
+          ManagedPolicyArns:
+            - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy # Permissões para ECS executar tarefas
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: ecs-tasks.amazonaws.com
+                Action: sts:AssumeRole
+          Path: /
+          # Adicione políticas específicas para sua aplicação aqui, se necessário.
+          # Ex: acesso a DynamoDB, SQS, etc.
+          Policies:
+            - PolicyName: AllowCloudWatchLogs
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - logs:CreateLogGroup
+                      - logs:CreateLogStream
+                      - logs:PutLogEvents
+                    Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-task-definition:*
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- ECS Task Definition (Backend) ---
+      ECSTaskDefinition:
+        Type: AWS::ECS::TaskDefinition
+        Properties:
+          Family: !Sub ${ProjectName}-task-definition
+          Cpu: '256' # 0.25 vCPU
+          Memory: '512' # 512 MB
+          NetworkMode: awsvpc
+          RequiresCompatibilities:
+            - FARGATE
+          ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+          TaskRoleArn: !GetAtt ECSTaskRole.Arn
+          ContainerDefinitions:
+            - Name: !Sub ${ProjectName}-container
+              Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest # A imagem será atualizada pelo pipeline
+              PortMappings:
+                - ContainerPort: 8000 # Porta que sua FastAPI escuta
+                  Protocol: tcp
+              LogConfiguration:
+                LogDriver: awslogs
+                Options:
+                  awslogs-group: !Sub /ecs/${ProjectName}-task-definition
+                  awslogs-region: !Ref AWS::Region
+                  awslogs-stream-prefix: ecs
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- CloudWatch Log Group para ECS Task Definition ---
+      ECSLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+          LogGroupName: !Sub /ecs/${ProjectName}-task-definition
+          RetentionInDays: 7 # Tempo de retenção dos logs
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- Application Load Balancer (ALB) ---
+      ALB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+          Name: !Sub ${ProjectName}-alb
+          Scheme: internet-facing
+          Subnets:
+            - !Ref PublicSubnetId1
+            - !Ref PublicSubnetId2
+          SecurityGroups:
+            - !GetAtt ALBSecurityGroup.GroupId
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      ALBListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+          LoadBalancerArn: !Ref ALB
+          Port: 80
+          Protocol: HTTP
+          DefaultActions:
+            - Type: forward
+              TargetGroupArn: !Ref ALBTargetGroup
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      ALBTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+          Name: !Sub ${ProjectName}-tg
+          Port: 8000 # Porta do container FastAPI
+          Protocol: HTTP
+          VpcId: !Ref VpcId
+          HealthCheckPath: / # Ou um endpoint de health check da sua API, ex: /health
+          HealthCheckIntervalSeconds: 30
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 2
+          TargetType: ip
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      ALBSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+          GroupName: !Sub ${ProjectName}-alb-sg
+          GroupDescription: Security group for ALB
+          VpcId: !Ref VpcId
+          SecurityGroupIngress:
+            - IpProtocol: tcp
+              FromPort: 80
+              ToPort: 80
+              CidrIp: 0.0.0.0/0 # Permitir tráfego HTTP de qualquer lugar
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      ECSServiceSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+          GroupName: !Sub ${ProjectName}-ecs-service-sg
+          GroupDescription: Security group for ECS Fargate tasks
+          VpcId: !Ref VpcId
+          SecurityGroupIngress:
+            - IpProtocol: tcp
+              FromPort: 8000 # Porta do container FastAPI
+              ToPort: 8000
+              SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId # Permitir tráfego apenas do ALB
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- ECS Service (Backend) ---
+      ECSService:
+        Type: AWS::ECS::Service
+        Properties:
+          ServiceName: !Sub ${ProjectName}-service
+          Cluster: !Ref ECSCluster
+          TaskDefinition: !Ref ECSTaskDefinition
+          LaunchType: FARGATE
+          DesiredCount: 1 # Número de instâncias da sua API
+          DeploymentConfiguration:
+            MaximumPercent: 200
+            MinimumHealthyPercent: 100
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: ENABLED # Ou DISABLED se usar NAT Gateway
+              Subnets:
+                - !Ref PrivateSubnetId1
+                - !Ref PrivateSubnetId2
+              SecurityGroups:
+                - !GetAtt ECSServiceSecurityGroup.GroupId
+          LoadBalancers:
+            - ContainerName: !Sub ${ProjectName}-container
+              ContainerPort: 8000
+              TargetGroupArn: !Ref ALBTargetGroup
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- IAM Role para CodeBuild (Backend) ---
+      CodeBuildServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: codebuild.amazonaws.com
+                Action: sts:AssumeRole
+          Path: /
+          Policies:
+            - PolicyName: CodeBuildBackendAccess
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - logs:CreateLogGroup
+                      - logs:CreateLogStream
+                      - logs:PutLogEvents
+                    Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-build-project:*
+                  - Effect: Allow
+                    Action:
+                      - ecr:GetAuthorizationToken
+                      - ecr:BatchCheckLayerAvailability
+                      - ecr:GetDownloadUrlForLayer
+                      - ecr:GetRepositoryPolicy
+                      - ecr:DescribeRepositories
+                      - ecr:ListImages
+                      - ecr:BatchGetImage
+                      - ecr:InitiateLayerUpload
+                      - ecr:UploadLayerPart
+                      - ecr:CompleteLayerUpload
+                      - ecr:PutImage
+                    Resource: !GetAtt ECRRepository.Arn
+                  - Effect: Allow
+                    Action:
+                      - s3:GetObject
+                      - s3:PutObject
+                      - s3:GetObjectVersion
+                      - s3:GetBucketAcl
+                      - s3:GetBucketLocation
+                    Resource:
+                      - !GetAtt CodePipelineArtifactsBucket.Arn
+                      - !Join ['', [!GetAtt CodePipelineArtifactsBucket.Arn, '/*']]
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- CodeBuild Project (Backend) ---
+      CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+          Name: !Sub ${ProjectName}-build-project
+          Description: Projeto CodeBuild para construir e enviar a imagem Docker do Backend.
+          ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+          Artifacts:
+            Type: CODEPIPELINE # O CodePipeline receberá os artefatos do build (imagedefinitions.json)
+          Environment:
+            ComputeType: BUILD_GENERAL1_SMALL
+            Image: aws/codebuild/standard:5.0 # Imagem com Docker pré-instalado
+            Type: LINUX_CONTAINER
+            PrivilegedMode: true # Necessário para construir imagens Docker
+            EnvironmentVariables:
+              - Name: AWS_ACCOUNT_ID
+                Value: !Ref AWS::AccountId
+              - Name: ECR_REPOSITORY_URI
+                Value: !GetAtt ECRRepository.RepositoryUri
+              - Name: CONTAINER_NAME # Nome do container na Task Definition
+                Value: !Sub ${ProjectName}-container
+          Source:
+            Type: CODEPIPELINE # O CodePipeline fornecerá a fonte
+            BuildSpec: buildspec.yml # O arquivo buildspec.yml estará na raiz do repositório do backend
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- S3 Bucket para armazenar artefatos do CodePipeline ---
+      CodePipelineArtifactsBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+          BucketName: !Ref S3ArtifactBucketName
+          VersioningConfiguration:
+            Status: Enabled
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+        DeletionPolicy: Retain # Mantém o bucket mesmo se a stack for deletada
+
+      # --- IAM Role para CodePipeline ---
+      CodePipelineServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: codepipeline.amazonaws.com
+                Action: sts:AssumeRole
+          Path: /
+          Policies:
+            - PolicyName: CodePipelineAccess
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - s3:GetObject
+                      - s3:PutObject
+                      - s3:GetObjectVersion
+                      - s3:GetBucketAcl
+                      - s3:GetBucketLocation
+                    Resource:
+                      - !GetAtt CodePipelineArtifactsBucket.Arn
+                      - !Join ['', [!GetAtt CodePipelineArtifactsBucket.Arn, '/*']]
+                  - Effect: Allow
+                    Action:
+                      - codebuild:StartBuild
+                      - codebuild:BatchGetBuilds
+                    Resource: !GetAtt CodeBuildProject.Arn
+                  - Effect: Allow
+                    Action:
+                      - ecs:DescribeServices
+                      - ecs:DescribeTaskDefinition
+                      - ecs:DescribeTasks
+                      - ecs:ListTasks
+                      - ecs:UpdateService
+                    Resource: !GetAtt ECSService.Arn
+                  - Effect: Allow
+                    Action:
+                      - iam:PassRole
+                    Resource:
+                      - !GetAtt CodeBuildServiceRole.Arn
+                      - !GetAtt ECSTaskExecutionRole.Arn
+                      - !GetAtt ECSTaskRole.Arn
+                    Condition:
+                      StringEqualsIfExists:
+                        iam:PassedToService:
+                          - codebuild.amazonaws.com
+                          - codepipeline.amazonaws.com
+                          - ecs-tasks.amazonaws.com
+                  - Effect: Allow
+                    Action:
+                      - codestar-connections:UseConnection
+                    Resource: !Ref GitHubConnectionArn
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+
+      # --- CodePipeline ---
+      MyCodePipeline:
+        Type: AWS::CodePipeline::Pipeline
+        Properties:
+          Name: !Sub ${ProjectName}-pipeline
+          RoleArn: !GetAtt CodePipelineServiceRole.Arn
+          ArtifactStore:
+            Type: S3
+            Location: !Ref CodePipelineArtifactsBucket
+          Stages:
+            - Name: Source
+              Actions:
+                - Name: Source
+                  ActionTypeId:
+                    Category: Source
+                    Owner: AWS
+                    Provider: GitHub
+                    Version: '1'
+                  OutputArtifacts:
+                    - Name: SourceOutput
+                  Configuration:
+                    ConnectionArn: !Ref GitHubConnectionArn
+                    Owner: !Ref GitHubOwner
+                    Repo: !Ref GitHubRepoName
+                    Branch: !Ref GitHubBranch
+                    FullRepositoryId: !Join ['', [!Ref GitHubOwner, '/', !Ref GitHubRepoName]]
+                    PollForSourceChanges: false # Usar webhooks via CodeStar Connections
+                  RunOrder: 1
+            - Name: Build
+              Actions:
+                - Name: BuildAndPushImage
+                  ActionTypeId:
+                    Category: Build
+                    Owner: AWS
+                    Provider: CodeBuild
+                    Version: '1'
+                  InputArtifacts:
+                    - Name: SourceOutput
+                  OutputArtifacts:
+                    - Name: BuildOutput # Contém imagedefinitions.json
+                  Configuration:
+                    ProjectName: !Ref CodeBuildProject
+                  RunOrder: 1
+            - Name: Deploy
+              Actions:
+                - Name: DeployToECS
+                  ActionTypeId:
+                    Category: Deploy
+                    Owner: AWS
+                    Provider: ECS
+                    Version: '1'
+                  InputArtifacts:
+                    - Name: BuildOutput # Contém imagedefinitions.json
+                  Configuration:
+                    ClusterName: !Ref ECSCluster
+                    ServiceName: !Ref ECSService
+                  RunOrder: 1
+
+    Outputs:
+      ECRRepositoryUri:
+        Description: URI do repositório ECR para a imagem Docker do Backend.
+        Value: !GetAtt ECRRepository.RepositoryUri
+      ALBDNSName:
+        Description: Nome DNS do Application Load Balancer para a API FastAPI.
+        Value: !GetAtt ALB.DNSName
+      CodePipelineName:
+        Description: Nome do pipeline CodePipeline do Backend.
+        Value: !Ref MyCodePipeline
+    
