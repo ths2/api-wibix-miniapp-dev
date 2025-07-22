@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infraestrutura ECS para simple API
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC onde ECS vai rodar
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets para ECS (mínimo 2)
+
+Resources:
+
+  SimpleECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: simple-api-repo
+
+  SimpleCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: simple-api-cluster
+
+  SimpleTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: simple-api-task-exec-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  SimpleTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: simple-api-task
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt SimpleTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: simple-api-container
+          Image: "REPLACE_IMAGE"
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+
+  SimpleServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite acesso HTTP ao service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  SimpleService:
+    Type: AWS::ECS::Service
+    DependsOn: SimpleALBListener
+    Properties:
+      Cluster: !Ref SimpleCluster
+      ServiceName: simple-api-service
+      TaskDefinition: !Ref SimpleTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SimpleServiceSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: simple-api-container
+          ContainerPort: 80
+          TargetGroupArn: !Ref SimpleTargetGroup
+
+  SimpleALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: simple-api-alb
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref SimpleServiceSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  SimpleTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: simple-api-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /
+
+  SimpleALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SimpleTargetGroup
+      LoadBalancerArn: !Ref SimpleALB
+      Port: 80
+      Protocol: HTTP
+
+Outputs:
+  LoadBalancerDNS:
+    Description: URL para acessar a API
+    Value: !GetAtt SimpleALB.DNSName
